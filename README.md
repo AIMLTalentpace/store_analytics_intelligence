@@ -17,10 +17,16 @@
    ```
 
 3. Check the installed correctly or not.
-   ``` python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; print(Gst.version())" ```
-4. Create the python environment
-   ``` python3 -m venv venv --system-site-packages```
-5. Activate the environment
-   ```source venv/bin/activate```
+   ```
+   python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; print(Gst.version())"
+   ```
+5. Create the python environment
+   ```
+    python3 -m venv venv --system-site-packages
+   ```
+7. Activate the environment
+   ```
+   source venv/bin/activate
+   ```
 
 
