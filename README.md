@@ -16,7 +16,7 @@
    gstreamer1.0-libav
    ```
 
-3. Check the installed correctly or not.
+3. Check the GStreamer is installed correctly or not.
    ```
    python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; print(Gst.version())"
    ```
@@ -28,5 +28,11 @@
    ```
    source venv/bin/activate
    ```
+8. Install the required python libraries:
+   ```
+   pip install ultralytics
+   pip install opencv-python
+   ```
+   
 
 
