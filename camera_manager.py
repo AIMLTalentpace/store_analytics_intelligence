@@ -11,7 +11,6 @@ import sys
 import time
 import cv2
 
-
 def make_no_signal_frame(width, height):
     try:
         frame = np.zeros((height, width, 3), dtype=np.uint8)
@@ -37,10 +36,8 @@ def make_no_signal_frame(width, height):
             cv2.line(frame, (j, 0), (j, height), line_color, 1)
 
         return frame
-    except Exception as e:
-        print(f"[Util] No signal frame error: {e}")
+    except Exception:
         return np.zeros((height, width, 3), dtype=np.uint8)
-
 
 class StreamProcessor(mp.Process):
     def __init__(self, cam_id, url, frame_queue, img_size, buffer_size, fps):
@@ -60,12 +57,11 @@ class StreamProcessor(mp.Process):
                 f'rtspsrc location="{self.url}" protocols=tcp latency=300 retry=3 timeout=5000000 ! '
                 f'rtph265depay ! h265parse ! avdec_h265 ! '
                 f'videorate ! video/x-raw,framerate={self.fps}/1 ! '
-                f'videoconvert ! videoscale ! '
+                f'videoconvert ! videoscale method=3 ! '
                 f'video/x-raw,width={self.width},height={self.height},format=BGR ! '
                 f'appsink name=sink emit-signals=true sync=false max-buffers={self.buffer_size} drop=true'
             )
-        except Exception as e:
-            print(f"[Cam {self.cam_id}] Pipeline build error: {e}")
+        except Exception:
             return None
 
     def on_sample(self, sink):
@@ -91,13 +87,13 @@ class StreamProcessor(mp.Process):
                     if self.frame_queue.full():
                         self.frame_queue.get_nowait()
                     self.frame_queue.put_nowait(frame)
-                except Exception as e:
-                    print(f"[Cam {self.cam_id}] Queue error: {e}")
+                except Exception:
+                    pass
             finally:
                 buf.unmap(map_info)
 
-        except Exception as e:
-            print(f"[Cam {self.cam_id}] Sample error: {e}")
+        except Exception:
+            pass
 
         return Gst.FlowReturn.OK
 
@@ -106,8 +102,8 @@ class StreamProcessor(mp.Process):
             if self.pipeline:
                 self.pipeline.set_state(Gst.State.NULL)
                 self.pipeline.get_state(timeout=2 * Gst.SECOND)
-        except Exception as e:
-            print(f"[Cam {self.cam_id}] Cleanup error: {e}")
+        except Exception:
+            pass
         finally:
             self.pipeline = None
 
@@ -115,13 +111,12 @@ class StreamProcessor(mp.Process):
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             signal.signal(signal.SIGTERM, lambda s, f: setattr(self.running, 'value', False))
-        except Exception as e:
-            print(f"[Cam {self.cam_id}] Signal setup error: {e}")
+        except Exception:
+            pass
 
         try:
             Gst.init(None)
-        except Exception as e:
-            print(f"[Cam {self.cam_id}] GStreamer init error: {e}")
+        except Exception:
             return
 
         while self.running.value:
@@ -129,17 +124,17 @@ class StreamProcessor(mp.Process):
                 self.pipeline = self._build_pipeline()
 
                 if self.pipeline is None:
-                    raise RuntimeError("Pipeline could not be created")
+                    raise RuntimeError()
 
                 try:
                     sink = self.pipeline.get_by_name("sink")
                     sink.connect("new-sample", self.on_sample)
-                except Exception as e:
-                    raise RuntimeError(f"Sink connection error: {e}")
+                except Exception:
+                    raise RuntimeError()
 
                 ret = self.pipeline.set_state(Gst.State.PLAYING)
                 if ret == Gst.StateChangeReturn.FAILURE:
-                    raise RuntimeError("Pipeline failed to enter PLAYING state")
+                    raise RuntimeError()
 
                 try:
                     bus = self.pipeline.get_bus()
@@ -148,20 +143,16 @@ class StreamProcessor(mp.Process):
                             msg = bus.timed_pop(100 * Gst.MSECOND)
                             if msg:
                                 if msg.type == Gst.MessageType.ERROR:
-                                    err, debug = msg.parse_error()
-                                    print(f"[Cam {self.cam_id}] GStreamer error: {err} | {debug}")
                                     break
                                 elif msg.type == Gst.MessageType.EOS:
-                                    print(f"[Cam {self.cam_id}] End of stream")
                                     break
-                        except Exception as e:
-                            print(f"[Cam {self.cam_id}] Bus poll error: {e}")
+                        except Exception:
                             break
-                except Exception as e:
-                    print(f"[Cam {self.cam_id}] Bus error: {e}")
+                except Exception:
+                    pass
 
-            except Exception as e:
-                print(f"[Cam {self.cam_id}] Stream error: {e}")
+            except Exception:
+                pass
             finally:
                 self._cleanup()
 
@@ -171,24 +162,22 @@ class StreamProcessor(mp.Process):
                 except Exception:
                     pass
 
-
 class MultiCameraManager:
-    def __init__(self, cameras, buffer_size=3, fps=15, img_size=(640, 640), num_cores=None):
+    def __init__(self, cameras, buffer_size=2, fps=15, img_size=(640, 640)):
         self.urls = cameras
         self.img_size = img_size
         self.buffer_size = buffer_size
         self.fps = fps
-        self.num_cores = num_cores
         self.queues = []
         self.processes = []
         self._stopped = False
         self._no_signal_frames = {}
         self._last_frame_time = {}
+        self._current_frames = {}
 
         try:
             self.queues = [mp.Queue(maxsize=buffer_size) for _ in cameras]
-        except Exception as e:
-            print(f"[Manager] Queue creation error: {e}")
+        except Exception:
             sys.exit(1)
 
         try:
@@ -196,14 +185,15 @@ class MultiCameraManager:
             for i in range(len(cameras)):
                 self._no_signal_frames[i] = no_signal
                 self._last_frame_time[i] = time.time()
-        except Exception as e:
-            print(f"[Manager] No signal frame creation error: {e}")
+                self._current_frames[i] = no_signal
+        except Exception:
+            pass
 
         try:
             signal.signal(signal.SIGINT, self._shutdown)
             signal.signal(signal.SIGTERM, self._shutdown)
-        except Exception as e:
-            print(f"[Manager] Signal setup error: {e}")
+        except Exception:
+            pass
 
         for i, url in enumerate(self.urls):
             try:
@@ -211,33 +201,49 @@ class MultiCameraManager:
                 p.daemon = True
                 p.start()
                 self.processes.append(p)
-            except Exception as e:
-                print(f"[Manager] Failed to start cam {i}: {e}")
+            except Exception:
+                pass
 
-    def get_latest_frames(self):
-        frames = {}
+    def _update_frames(self):
         for cam_id, q in enumerate(self.queues):
+            latest = None
             try:
-                latest = None
                 while not q.empty():
                     try:
                         latest = q.get_nowait()
                     except Exception:
                         break
+            except Exception:
+                pass
 
-                if latest is not None:
-                    self._last_frame_time[cam_id] = time.time()
-                    frames[cam_id] = latest
-                else:
-                    elapsed = time.time() - self._last_frame_time.get(cam_id, 0)
-                    if elapsed > 2.0:
-                        frames[cam_id] = self._no_signal_frames.get(cam_id)
+            if latest is not None:
+                self._last_frame_time[cam_id] = time.time()
+                if latest.shape[:2] != (self.img_size[1], self.img_size[0]):
+                    latest = cv2.resize(latest, self.img_size, interpolation=cv2.INTER_CUBIC)
+                self._current_frames[cam_id] = latest
+            else:
+                elapsed = time.time() - self._last_frame_time.get(cam_id, 0)
+                if elapsed > 2.0:
+                    self._current_frames[cam_id] = self._no_signal_frames.get(cam_id)
 
-            except Exception as e:
-                print(f"[Manager] Frame fetch error cam {cam_id}: {e}")
-                frames[cam_id] = self._no_signal_frames.get(cam_id)
+    def display_streams(self):
+        cv2.namedWindow("Multi Camera View", cv2.WINDOW_NORMAL)
+        delay = max(1, int(1000 / self.fps))
+        
+        try:
+            while not self._stopped:
+                self._update_frames()
+                
+                combined = np.hstack([self._current_frames[i] for i in range(len(self.urls))])
+                cv2.imshow("Multi Camera View", combined)
 
-        return frames
+                if cv2.waitKey(delay) & 0xFF == ord('q'):
+                    break
+        except Exception:
+            pass
+        finally:
+            self.stop()
+            cv2.destroyAllWindows()
 
     def stop(self):
         if self._stopped:
@@ -247,17 +253,15 @@ class MultiCameraManager:
         for p in self.processes:
             try:
                 p.running.value = False
-            except Exception as e:
-                print(f"[Manager] Error signalling cam {p.cam_id}: {e}")
+            except Exception:
+                pass
 
         for p in self.processes:
             try:
                 if p.is_alive():
                     os.kill(p.pid, signal.SIGTERM)
-            except ProcessLookupError:
+            except Exception:
                 pass
-            except Exception as e:
-                print(f"[Manager] Error sending SIGTERM to cam {p.cam_id}: {e}")
 
         for p in self.processes:
             try:
@@ -265,8 +269,8 @@ class MultiCameraManager:
                 if p.is_alive():
                     p.kill()
                     p.join(timeout=2)
-            except Exception as e:
-                print(f"[Manager] Error joining cam {p.cam_id}: {e}")
+            except Exception:
+                pass
 
         for q in self.queues:
             try:
@@ -277,8 +281,8 @@ class MultiCameraManager:
                         break
                 q.close()
                 q.join_thread()
-            except Exception as e:
-                print(f"[Manager] Queue cleanup error: {e}")
+            except Exception:
+                pass
 
         self.processes.clear()
 
@@ -288,10 +292,7 @@ class MultiCameraManager:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
         except Exception:
             pass
-        try:
-            self.stop()
-        except Exception as e:
-            print(f"[Manager] Shutdown error: {e}")
+        self.stop()
         try:
             cv2.destroyAllWindows()
         except Exception:
