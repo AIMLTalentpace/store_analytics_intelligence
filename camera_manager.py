@@ -10,6 +10,7 @@ import signal
 import sys
 import time
 import cv2
+from model import Detector
 
 def make_no_signal_frame(width, height):
     try:
@@ -175,6 +176,9 @@ class MultiCameraManager:
         self._last_frame_time = {}
         self._current_frames = {}
 
+        # Load the YOLO model detector
+        self.detector = Detector()
+
         try:
             self.queues = [mp.Queue(maxsize=buffer_size) for _ in cameras]
         except Exception:
@@ -205,8 +209,9 @@ class MultiCameraManager:
                 pass
 
     def _run_inference(self, frame, cam_id):
-        # Place your model inference and annotation logic here
-        return frame
+        annotated = self.detector.process_frame(frame)
+        cv2.putText(annotated, f"CAM {cam_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        return annotated
 
     def _update_frames(self):
         for cam_id, q in enumerate(self.queues):
