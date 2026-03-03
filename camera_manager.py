@@ -204,6 +204,10 @@ class MultiCameraManager:
             except Exception:
                 pass
 
+    def _run_inference(self, frame, cam_id):
+        # Place your model inference and annotation logic here
+        return frame
+
     def _update_frames(self):
         for cam_id, q in enumerate(self.queues):
             latest = None
@@ -220,7 +224,10 @@ class MultiCameraManager:
                 self._last_frame_time[cam_id] = time.time()
                 if latest.shape[:2] != (self.img_size[1], self.img_size[0]):
                     latest = cv2.resize(latest, self.img_size, interpolation=cv2.INTER_CUBIC)
-                self._current_frames[cam_id] = latest
+                
+                # Apply inference and annotation
+                processed_frame = self._run_inference(latest, cam_id)
+                self._current_frames[cam_id] = processed_frame
             else:
                 elapsed = time.time() - self._last_frame_time.get(cam_id, 0)
                 if elapsed > 2.0:

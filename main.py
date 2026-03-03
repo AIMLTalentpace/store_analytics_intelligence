@@ -6,14 +6,5 @@ if __name__ == "__main__":
         "rtsp://10.64.36.14:554/rtsp/streaming?channel=01&subtype=1",
     ]
 
-    IMG_SIZE = (800, 640)
-    TARGET_FPS = 15
-
-    manager = MultiCameraManager(
-        cameras=cameras,
-        buffer_size=2,
-        fps=TARGET_FPS,
-        img_size=IMG_SIZE
-    )
-
+    manager = MultiCameraManager(cameras=cameras, buffer_size=2, fps=15, img_size=(800, 640))
     manager.display_streams()
