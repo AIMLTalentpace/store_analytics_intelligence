@@ -33,9 +33,9 @@ class Detector:
                 x1, y1, x2, y2 = box.astype(int)
 
                 # Draw thin bounding box
-                cv2.rectangle(output, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                cv2.rectangle(output, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                label = f"{track_id}"
+                label = f"id: {track_id}"
                 font_scale = 0.4
                 thickness = 1
 

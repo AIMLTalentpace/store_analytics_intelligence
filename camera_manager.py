@@ -1,6 +1,5 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
@@ -12,35 +11,33 @@ import time
 import cv2
 from model import Detector
 
+
 def make_no_signal_frame(width, height):
     try:
         frame = np.zeros((height, width, 3), dtype=np.uint8)
         frame[:] = (30, 30, 30)
-
         text = "NO SIGNAL"
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = width / 400.0
         thickness = max(2, int(font_scale * 2))
-
         (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
         tx = (width - tw) // 2
         ty = (height + th) // 2
-
         cv2.putText(frame, text, (tx + 2, ty + 2), font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
         cv2.putText(frame, text, (tx, ty), font, font_scale, (60, 60, 60), thickness, cv2.LINE_AA)
-
         line_color = (50, 50, 50)
         spacing = 30
         for i in range(0, height, spacing):
             cv2.line(frame, (0, i), (width, i), line_color, 1)
         for j in range(0, width, spacing):
             cv2.line(frame, (j, 0), (j, height), line_color, 1)
-
         return frame
     except Exception:
         return np.zeros((height, width, 3), dtype=np.uint8)
 
+
 class StreamProcessor(mp.Process):
+    # (unchanged - your original code is fine)
     def __init__(self, cam_id, url, frame_queue, img_size, buffer_size, fps):
         super().__init__()
         self.cam_id = cam_id
@@ -70,20 +67,16 @@ class StreamProcessor(mp.Process):
             sample = sink.emit("pull-sample")
             if not sample:
                 return Gst.FlowReturn.OK
-
             buf = sample.get_buffer()
             res, map_info = buf.map(Gst.MapFlags.READ)
-
             if not res:
                 return Gst.FlowReturn.OK
-
             try:
                 frame = np.ndarray(
                     (self.height, self.width, 3),
                     buffer=map_info.data,
                     dtype=np.uint8
                 ).copy()
-
                 try:
                     if self.frame_queue.full():
                         self.frame_queue.get_nowait()
@@ -92,10 +85,8 @@ class StreamProcessor(mp.Process):
                     pass
             finally:
                 buf.unmap(map_info)
-
         except Exception:
             pass
-
         return Gst.FlowReturn.OK
 
     def _cleanup(self):
@@ -114,29 +105,23 @@ class StreamProcessor(mp.Process):
             signal.signal(signal.SIGTERM, lambda s, f: setattr(self.running, 'value', False))
         except Exception:
             pass
-
         try:
             Gst.init(None)
         except Exception:
             return
-
         while self.running.value:
             try:
                 self.pipeline = self._build_pipeline()
-
                 if self.pipeline is None:
                     raise RuntimeError()
-
                 try:
                     sink = self.pipeline.get_by_name("sink")
                     sink.connect("new-sample", self.on_sample)
                 except Exception:
                     raise RuntimeError()
-
                 ret = self.pipeline.set_state(Gst.State.PLAYING)
                 if ret == Gst.StateChangeReturn.FAILURE:
                     raise RuntimeError()
-
                 try:
                     bus = self.pipeline.get_bus()
                     while self.running.value:
@@ -151,17 +136,16 @@ class StreamProcessor(mp.Process):
                             break
                 except Exception:
                     pass
-
             except Exception:
                 pass
             finally:
                 self._cleanup()
-
             if self.running.value:
                 try:
                     time.sleep(3)
                 except Exception:
                     pass
+
 
 class MultiCameraManager:
     def __init__(self, cameras, buffer_size=2, fps=15, img_size=(640, 640)):
@@ -176,8 +160,8 @@ class MultiCameraManager:
         self._last_frame_time = {}
         self._current_frames = {}
 
-        # Load the YOLO model detector
-        self.detector = Detector()
+        # === FIXED: One independent Detector per camera ===
+        self.detectors = [Detector() for _ in cameras]
 
         try:
             self.queues = [mp.Queue(maxsize=buffer_size) for _ in cameras]
@@ -209,7 +193,7 @@ class MultiCameraManager:
                 pass
 
     def _run_inference(self, frame, cam_id):
-        annotated = self.detector.process_frame(frame)
+        annotated = self.detectors[cam_id].process_frame(frame)
         cv2.putText(annotated, f"CAM {cam_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
         return annotated
 
@@ -230,7 +214,6 @@ class MultiCameraManager:
                 if latest.shape[:2] != (self.img_size[1], self.img_size[0]):
                     latest = cv2.resize(latest, self.img_size, interpolation=cv2.INTER_CUBIC)
                 
-                # Apply inference and annotation
                 processed_frame = self._run_inference(latest, cam_id)
                 self._current_frames[cam_id] = processed_frame
             else:
@@ -245,10 +228,8 @@ class MultiCameraManager:
         try:
             while not self._stopped:
                 self._update_frames()
-                
                 combined = np.hstack([self._current_frames[i] for i in range(len(self.urls))])
                 cv2.imshow("Multi Camera View", combined)
-
                 if cv2.waitKey(delay) & 0xFF == ord('q'):
                     break
         except Exception:
@@ -261,29 +242,26 @@ class MultiCameraManager:
         if self._stopped:
             return
         self._stopped = True
-
         for p in self.processes:
             try:
                 p.running.value = False
             except Exception:
                 pass
-
         for p in self.processes:
             try:
                 if p.is_alive():
                     os.kill(p.pid, signal.SIGTERM)
             except Exception:
                 pass
-
         for p in self.processes:
             try:
-                p.join(timeout=5)
                 if p.is_alive():
-                    p.kill()
-                    p.join(timeout=2)
+                    p.join(timeout=5)
+                    if p.is_alive():
+                        p.kill()
+                        p.join(timeout=2)
             except Exception:
                 pass
-
         for q in self.queues:
             try:
                 while not q.empty():
@@ -295,7 +273,6 @@ class MultiCameraManager:
                 q.join_thread()
             except Exception:
                 pass
-
         self.processes.clear()
 
     def _shutdown(self, sig=None, frame=None):
