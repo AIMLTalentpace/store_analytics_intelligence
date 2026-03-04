@@ -26,7 +26,7 @@ def make_no_signal_frame(width, height):
         cv2.putText(frame, text, (tx + 2, ty + 2), font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
         cv2.putText(frame, text, (tx, ty), font, font_scale, (60, 60, 60), thickness, cv2.LINE_AA)
         line_color = (50, 50, 50)
-        spacing = 30
+        spacing = max(20, width // 32)
         for i in range(0, height, spacing):
             cv2.line(frame, (0, i), (width, i), line_color, 1)
         for j in range(0, width, spacing):
@@ -37,7 +37,6 @@ def make_no_signal_frame(width, height):
 
 
 class StreamProcessor(mp.Process):
-    # (unchanged - your original code is fine)
     def __init__(self, cam_id, url, frame_queue, img_size, buffer_size, fps):
         super().__init__()
         self.cam_id = cam_id
@@ -160,8 +159,7 @@ class MultiCameraManager:
         self._last_frame_time = {}
         self._current_frames = {}
 
-        # === FIXED: One independent Detector per camera ===
-        self.detectors = [Detector() for _ in cameras]
+        self.detectors = [Detector(img_size=img_size) for _ in cameras]
 
         try:
             self.queues = [mp.Queue(maxsize=buffer_size) for _ in cameras]
@@ -193,8 +191,14 @@ class MultiCameraManager:
                 pass
 
     def _run_inference(self, frame, cam_id):
+        h, w = self.img_size[1], self.img_size[0]
+        if frame.shape[:2] != (h, w):
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
         annotated = self.detectors[cam_id].process_frame(frame)
-        cv2.putText(annotated, f"CAM {cam_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        label = f"CAM {cam_id}"
+        font_scale = max(0.5, self.img_size[0] / 900)
+        thickness = max(1, int(font_scale * 2))
+        cv2.putText(annotated, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
         return annotated
 
     def _update_frames(self):
@@ -211,9 +215,6 @@ class MultiCameraManager:
 
             if latest is not None:
                 self._last_frame_time[cam_id] = time.time()
-                if latest.shape[:2] != (self.img_size[1], self.img_size[0]):
-                    latest = cv2.resize(latest, self.img_size, interpolation=cv2.INTER_CUBIC)
-                
                 processed_frame = self._run_inference(latest, cam_id)
                 self._current_frames[cam_id] = processed_frame
             else:
@@ -222,13 +223,22 @@ class MultiCameraManager:
                     self._current_frames[cam_id] = self._no_signal_frames.get(cam_id)
 
     def display_streams(self):
+        win_w = self.img_size[0] * len(self.urls)
+        win_h = self.img_size[1]
         cv2.namedWindow("Multi Camera View", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Multi Camera View", win_w, win_h)
         delay = max(1, int(1000 / self.fps))
-        
+
         try:
             while not self._stopped:
                 self._update_frames()
-                combined = np.hstack([self._current_frames[i] for i in range(len(self.urls))])
+                frames = []
+                for i in range(len(self.urls)):
+                    f = self._current_frames[i]
+                    if f is None or f.shape[:2] != (self.img_size[1], self.img_size[0]):
+                        f = self._no_signal_frames[i]
+                    frames.append(f)
+                combined = np.hstack(frames)
                 cv2.imshow("Multi Camera View", combined)
                 if cv2.waitKey(delay) & 0xFF == ord('q'):
                     break
