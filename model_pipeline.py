@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import cv2
 import numpy as np
@@ -18,15 +19,16 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 import torch
+import inspect
 from transformers import AutoModelForImageClassification, AutoConfig, AutoImageProcessor
 
 CONFIG_API_URL = "http://localhost:5000/api/cameras/coordinates"
 YOLO_INPUT_SIZE = 640
-YOLO_CONF = 0.40
+YOLO_CONF = 0.35
 YOLO_IOU = 0.50
 PERSON_CLASS = 0
 FACE_DET_SIZE = 640
-FACE_DET_THRESH = 0.30
+FACE_DET_THRESH = 0.55
 COLOR_MALE = (255, 140, 0)
 COLOR_FEMALE = (219, 39, 119)
 COLOR_UNKNOWN = (160, 160, 160)
@@ -46,22 +48,33 @@ FULL_RES_H = 720
 PROC_EVERY = 1
 
 VOTE_WINDOW = 120
-MIN_GENDER_VOTES_TO_DECIDE = 3
-DB_COMMIT_MIN_VOTES = 3
-DB_COMMIT_MIN_STABLE_STREAK = 2
-MAX_ALLOWED_FLIPS = 4
+MIN_GENDER_VOTES_TO_DECIDE = 5
+DB_COMMIT_MIN_VOTES = 5
+DB_COMMIT_MIN_STABLE_STREAK = 3
+MAX_ALLOWED_FLIPS = 2
 
-GENDER_MALE_BIAS_THRESHOLD = 0.50
-FACE_VOTE_WEIGHT = 4
-MIN_FACE_VOTES_TO_DECIDE = 2
-FACE_LOCK_THRESHOLD = 4
+GENDER_MALE_THRESHOLD = 0.55
+GENDER_FEMALE_THRESHOLD = 0.45
+FACE_LOCK_STRONG_HIGH = 0.75
+FACE_LOCK_STRONG_LOW = 0.25
+BODY_CONFIDENT_HIGH = 0.62
+BODY_CONFIDENT_LOW = 0.38
+
+FACE_VOTE_WEIGHT = 3
+BODY_VOTE_WEIGHT = 2
+MIN_FACE_VOTES_TO_DECIDE = 4
+FACE_LOCK_THRESHOLD = 6
 
 BACK_VIEW_MIN_FACE_AREA_RATIO = 0.003
 BACK_VIEW_FACE_PRESENCE_WINDOW = 30
 BACK_VIEW_FACE_MIN_RATIO = 0.25
+ENTRY_LINE_COOLDOWN_FRAMES = 45
 
 ENTRY_COMMIT_FRAME_BUDGET = 900
-SHARPNESS_THRESHOLD = 1.5
+SHARPNESS_THRESHOLD = 3.5
+FACE_SHARPNESS_THRESHOLD = 5.0
+MIN_FACE_SIZE = 40
+MIN_BODY_SIZE = 16
 YOLOV8_FACE_MODEL_PATH = "/home/in_rajshek/AIML/new_gender_model/demo/yolov8n-face.pt"
 PRESENCE_DEBOUNCE_SEC = float(os.environ.get("PRESENCE_DEBOUNCE_SEC", "1.5"))
 ALERTS_UPDATE_INTERVAL_MIN = float(os.environ.get("ALERTS_UPDATE_INTERVAL_MIN", "1.0"))
@@ -73,6 +86,8 @@ ENTRY_COUNTER_SAW_OUTER_TIMEOUT_FRAMES = 300
 ZONE_MIN_FRAMES_INSIDE = 3
 ZONE_MIN_FRAMES_OUTSIDE = 2
 
+ZONE_VISIT_MIN_DWELL_SEC = 5.0
+
 _ZONE_PALETTE = [(0,200,255),(0,220,80),(200,60,255),(255,140,0),(255,60,100),(60,180,255),(120,255,80)]
 _ZONE_FONT = cv2.FONT_HERSHEY_SIMPLEX
 _ZONE_FONT_SCALE = 0.58
@@ -83,19 +98,64 @@ _PRESENCE_COLOR_ALERT = (0, 0, 200)
 
 _db_lock = threading.Lock()
 
-BOTSORT_MAX_AGE = 300
+BOTSORT_MAX_AGE = 100
 BOTSORT_MIN_HITS = 1
 BOTSORT_IOU_THRESHOLD = 0.30
-BOTSORT_COAST_AGE = 90
+BOTSORT_COAST_AGE = 60
 BOTSORT_CASCADE_IOU_RATIO = 0.40
 SUPPRESS_IOU_THRESHOLD = 0.50
 APPEARANCE_HIST_BINS = 32
 APPEARANCE_BUFFER_LEN = 8
 APPEARANCE_WEIGHT = 0.35
 
+FACE_CROP_MARGIN_RATIO = 0.15
 
-def _is_back_view(person_bbox, face_bbox_or_none, frame_shape):
-    return face_bbox_or_none is None
+
+def _is_true_back_view(person_bbox, face_bbox_or_none, frame_shape):
+    px1, py1, px2, py2 = person_bbox[:4]
+    person_height = py2 - py1
+    person_width = px2 - px1
+
+    if face_bbox_or_none is not None:
+        fx1, fy1, fx2, fy2 = face_bbox_or_none[:4]
+        face_area = (fx2 - fx1) * (fy2 - fy1)
+        person_area = person_height * person_width
+        if person_area > 0 and face_area / person_area < BACK_VIEW_MIN_FACE_AREA_RATIO:
+            return True
+        face_cy = (fy1 + fy2) / 2.0
+        expected_face_cy = py1 + person_height * 0.25
+        if face_cy > expected_face_cy + person_height * 0.25:
+            return True
+        return False
+
+    upper_body_cutoff = frame_shape[0] * 0.15
+    if py1 < upper_body_cutoff:
+        return False
+
+    if person_height > frame_shape[0] * 0.15 and py2 > frame_shape[0] * 0.4:
+        aspect_ratio = person_width / max(person_height, 1)
+        if aspect_ratio < 0.65:
+            return True
+
+    return False
+
+
+def _validate_face_quality(face_crop_bgr):
+    if face_crop_bgr is None or face_crop_bgr.size == 0:
+        return False
+    fh, fw = face_crop_bgr.shape[:2]
+    if fw < MIN_FACE_SIZE or fh < MIN_FACE_SIZE:
+        return False
+    gray = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var < FACE_SHARPNESS_THRESHOLD:
+        return False
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+    hist = hist / (hist.sum() + 1e-6)
+    entropy = -np.sum(hist * np.log2(hist + 1e-6))
+    if entropy < 4.5:
+        return False
+    return True
 
 
 @dataclass
@@ -123,6 +183,8 @@ class _ZoneState:
     committed_inside: bool = False
     born_inside: bool = True
     lockdown_until: float = 0.0
+    dwell_start_mono: float = 0.0
+    visit_counted: bool = False
 
 
 class ZoneEvent:
@@ -264,42 +326,74 @@ class ZoneCounter:
         now_wall = datetime.now().isoformat(timespec="milliseconds")
         active_ids = {t["id"] for t in tracks}
         fired = []
+
         for track in tracks:
             tid = track["id"]
             bbox = track["bbox"]
             foot = ((bbox[0] + bbox[2]) >> 1, bbox[3])
+
             for zone_name, poly in self._polygons.items():
                 key = (tid, zone_name)
-                st = self._states.get(key)
                 currently_inside = self._is_inside(foot, poly)
+                st = self._states.get(key)
+
                 if st is None:
                     st = _ZoneState(
                         inside_streak=1 if currently_inside else 0,
                         outside_streak=0 if currently_inside else 1,
-                        committed_inside=False,
-                        born_inside=bool(currently_inside),
-                        lockdown_until=0.0)
+                        committed_inside=currently_inside,
+                        born_inside=currently_inside,
+                        lockdown_until=0.0,
+                        dwell_start_mono=now_mono if currently_inside else 0.0,
+                        visit_counted=False,
+                    )
                     self._states[key] = st
                     continue
+
                 if currently_inside:
                     st.inside_streak += 1
                     st.outside_streak = 0
+                    if st.dwell_start_mono == 0.0:
+                        st.dwell_start_mono = now_mono
                 else:
                     st.outside_streak += 1
                     st.inside_streak = 0
+
                 if now_mono < st.lockdown_until:
                     continue
+
                 if not st.committed_inside and st.inside_streak >= ZONE_MIN_FRAMES_INSIDE:
                     st.committed_inside = True
-                    if not st.born_inside:
+                    if st.dwell_start_mono == 0.0:
+                        st.dwell_start_mono = now_mono
+
+                elif st.committed_inside and st.outside_streak >= ZONE_MIN_FRAMES_OUTSIDE:
+                    if (st.dwell_start_mono > 0.0 and
+                        (now_mono - st.dwell_start_mono) >= ZONE_VISIT_MIN_DWELL_SEC and
+                        not st.visit_counted):
+
                         self.counts[zone_name]["entries"] += 1
+                        st.visit_counted = True
                         st.lockdown_until = now_mono + self.event_lockdown
                         fired.append(ZoneEvent(zone_name, tid, "entry", now_wall, foot))
-                elif st.committed_inside and st.outside_streak >= ZONE_MIN_FRAMES_OUTSIDE:
+
                     st.committed_inside = False
-                    st.born_inside = False
-        for k in [k for k in self._states if k[0] not in active_ids]:
+                    st.dwell_start_mono = 0.0
+
+        stale_keys = [k for k in self._states if k[0] not in active_ids]
+        for k in stale_keys:
+            st = self._states[k]
+            zone_name = k[1]
+            if (st.committed_inside and
+                not st.visit_counted and
+                st.dwell_start_mono > 0.0 and
+                (now_mono - st.dwell_start_mono) >= ZONE_VISIT_MIN_DWELL_SEC):
+
+                self.counts[zone_name]["entries"] += 1
+                fired.append(ZoneEvent(zone_name, k[0], "entry", now_wall, (0, 0)))
+
             del self._states[k]
+
         return fired
 
     def draw(self, frame, alpha=0.18):
@@ -513,76 +607,181 @@ class StaffPresenceMonitor:
 class GenderAgeClassifier:
     def __init__(self, device):
         self.device = device
+        self._infer_dtype = torch.float16 if device.type == "cuda" else torch.float32
+
         self.config = AutoConfig.from_pretrained("iitolstykh/mivolo_v2", trust_remote_code=True)
         self.model = AutoModelForImageClassification.from_pretrained(
-            "iitolstykh/mivolo_v2", trust_remote_code=True, torch_dtype=torch.float16).to(device)
+            "iitolstykh/mivolo_v2",
+            trust_remote_code=True,
+            torch_dtype=self._infer_dtype,
+        ).to(device)
         self.model.eval()
         self.processor = AutoImageProcessor.from_pretrained("iitolstykh/mivolo_v2", trust_remote_code=True)
+
         probe = self.processor(images=[np.zeros((64, 64, 3), dtype=np.uint8)])["pixel_values"]
         self.CROP_SIZE = (probe.shape[3], probe.shape[2])
         self._blank_face = np.zeros((self.CROP_SIZE[1], self.CROP_SIZE[0], 3), dtype=np.uint8)
-        self._male_class_id = next((k for k, v in self.config.gender_id2label.items() if v.lower() == "male"), 1)
+
+        self._male_class_id = None
+        self._female_class_id = None
+        for k, v in self.config.gender_id2label.items():
+            if v.lower() == "male":
+                self._male_class_id = k
+            elif v.lower() == "female":
+                self._female_class_id = k
+        if self._male_class_id is None:
+            self._male_class_id = 0
+        if self._female_class_id is None:
+            self._female_class_id = 1
+
+        self._face_kwarg = self._detect_face_kwarg()
+
+    def _detect_face_kwarg(self):
+        try:
+            sig = inspect.signature(self.model.forward)
+            params = list(sig.parameters.keys())
+            if "faces_input" in params:
+                return "faces_input"
+            if "face_input" in params:
+                return "face_input"
+        except Exception:
+            pass
+        return "faces_input"
+
+    def _to_tensor(self, crops_rgb):
+        pv = self.processor(images=crops_rgb)["pixel_values"]
+        return torch.tensor(np.array(pv), dtype=self._infer_dtype, device=self.device)
 
     def predict_batch(self, frame, items):
         if not items:
             return []
+
         h, w = frame.shape[:2]
-        body_crops, face_crops, valid_ids = [], [], []
+        body_crops_rgb, face_crops_rgb, valid_ids, has_face_flags = [], [], [], []
+
         for track_id, p_bbox, f_bbox in items:
             px1, py1, px2, py2 = map(int, p_bbox[:4])
             px1, py1 = max(0, px1), max(0, py1)
             px2, py2 = min(w, px2), min(h, py2)
-            if (py2 - py1) < 16 or (px2 - px1) < 16:
+            person_h = py2 - py1
+            person_w = px2 - px1
+            if person_h < MIN_BODY_SIZE or person_w < MIN_BODY_SIZE:
                 continue
-            body_crop = frame[py1:py2, px1:px2]
-            if body_crop.size == 0:
+
+            body_crop_bgr = frame[py1:py2, px1:px2]
+            if body_crop_bgr.size == 0:
                 continue
-            fx1, fy1, fx2, fy2 = map(int, f_bbox[:4])
-            fx1, fy1 = max(0, fx1), max(0, fy1)
-            fx2, fy2 = min(w, fx2), min(h, fy2)
-            face_raw = frame[fy1:fy2, fx1:fx2]
-            if face_raw.size == 0 or (fy2 - fy1) < 8 or (fx2 - fx1) < 8:
-                continue
-            face_crop = cv2.resize(face_raw, self.CROP_SIZE)
-            body_crops.append(cv2.resize(body_crop, self.CROP_SIZE))
-            face_crops.append(face_crop)
+
+            body_crop_rgb = cv2.cvtColor(body_crop_bgr, cv2.COLOR_BGR2RGB)
+            body_crops_rgb.append(cv2.resize(body_crop_rgb, self.CROP_SIZE, interpolation=cv2.INTER_LINEAR))
+
+            has_valid_face = False
+            if f_bbox is not None:
+                fx1, fy1, fx2, fy2 = map(int, f_bbox[:4])
+                fx1, fy1 = max(0, fx1), max(0, fy1)
+                fx2, fy2 = min(w, fx2), min(h, fy2)
+                face_raw = frame[fy1:fy2, fx1:fx2]
+                if _validate_face_quality(face_raw):
+                    margin_x = max(1, int((fx2 - fx1) * FACE_CROP_MARGIN_RATIO))
+                    margin_y = max(1, int((fy2 - fy1) * FACE_CROP_MARGIN_RATIO))
+                    efx1 = max(0, fx1 - margin_x)
+                    efy1 = max(0, fy1 - margin_y)
+                    efx2 = min(w, fx2 + margin_x)
+                    efy2 = min(h, fy2 + margin_y)
+                    face_extended = frame[efy1:efy2, efx1:efx2]
+                    if face_extended.size > 0:
+                        face_crop_rgb = cv2.cvtColor(face_extended, cv2.COLOR_BGR2RGB)
+                        face_crops_rgb.append(cv2.resize(face_crop_rgb, self.CROP_SIZE, interpolation=cv2.INTER_LINEAR))
+                        has_valid_face = True
+
+            if not has_valid_face:
+                face_crops_rgb.append(self._blank_face.copy())
+
+            has_face_flags.append(has_valid_face)
             valid_ids.append(track_id)
-        if not body_crops:
+
+        if not body_crops_rgb:
             return []
-        b_pv = torch.tensor(np.asarray(self.processor(images=body_crops)["pixel_values"]),
-                            dtype=torch.float16, device=self.device)
-        f_pv = torch.tensor(np.asarray(self.processor(images=face_crops)["pixel_values"]),
-                            dtype=torch.float16, device=self.device)
+
+        b_pv = self._to_tensor(body_crops_rgb)
+        f_pv = self._to_tensor(face_crops_rgb)
+
         with torch.inference_mode():
-            out = self.model(faces_input=f_pv, body_input=b_pv)
+            out = self.model(body_input=b_pv, **{self._face_kwarg: f_pv})
+
         ages = out.age_output.float().cpu().numpy().flatten()
-        genders_idx = out.gender_class_idx.cpu().numpy().flatten()
-        try:
-            gender_logits = out.gender_output.float()
-            gender_probs = torch.softmax(gender_logits, dim=-1).cpu().numpy()
-            male_prob_arr = gender_probs[:, self._male_class_id]
-        except AttributeError:
-            male_prob_arr = np.where(genders_idx == self._male_class_id, 0.58, 0.42).astype(np.float32)
+        gender_logits = out.raw_gender_output.float()
+        gender_probs = torch.softmax(gender_logits, dim=-1).cpu().numpy()
+        genders_idx = np.argmax(gender_probs, axis=1)
+        male_prob_arr = gender_probs[:, self._male_class_id]
+
         results = []
         for i in range(len(valid_ids)):
-            results.append((valid_ids[i], self.config.gender_id2label[int(genders_idx[i])],
-                            int(ages[i]), float(male_prob_arr[i])))
+            gender_label = self.config.gender_id2label[int(genders_idx[i])]
+            results.append((valid_ids[i], gender_label, int(ages[i]), float(male_prob_arr[i]), has_face_flags[i]))
         return results
 
 
 def match_face_to_bbox(person_bbox, face_boxes):
     px1, py1, px2, py2 = person_bbox[:4]
+    person_cx = (px1 + px2) / 2.0
+    person_height = py2 - py1
+    person_width = px2 - px1
     best_match = None
-    best_area = 0
+    best_score = -1.0
+
     for f_box in face_boxes:
         fx1, fy1, fx2, fy2 = f_box[:4]
         fcx = (fx1 + fx2) / 2.0
         fcy = (fy1 + fy2) / 2.0
-        if px1 < fcx < px2 and py1 < fcy < py2:
-            face_area = (fx2 - fx1) * (fy2 - fy1)
-            if face_area > best_area:
-                best_area = face_area
-                best_match = (fx1, fy1, fx2, fy2)
+        face_w = fx2 - fx1
+        face_h = fy2 - fy1
+        face_area = face_w * face_h
+
+        if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE:
+            continue
+
+        if not (px1 - person_width * 0.1 <= fcx <= px2 + person_width * 0.1 and
+                py1 - person_height * 0.1 <= fcy <= py2 + person_height * 0.1):
+            continue
+
+        expected_face_cy = py1 + person_height * 0.28
+        max_vertical_dev = person_height * 0.45
+        vertical_dev = abs(fcy - expected_face_cy)
+        if vertical_dev > max_vertical_dev:
+            vertical_pos_score = 0.0
+        else:
+            vertical_pos_score = 1.0 - (vertical_dev / max_vertical_dev)
+
+        horizontal_dev = abs(fcx - person_cx)
+        max_horizontal_dev = person_width * 0.7
+        if horizontal_dev > max_horizontal_dev:
+            horizontal_center_score = 0.0
+        else:
+            horizontal_center_score = 1.0 - (horizontal_dev / max_horizontal_dev)
+
+        expected_face_area = person_height * person_width * 0.06
+        size_score = min(1.0, face_area / max(expected_face_area, 100.0))
+        size_penalty = min(1.0, max(0.0, (face_area - expected_face_area * 4) / (expected_face_area * 10 + 1e-6)))
+        size_score = size_score * (1.0 - 0.3 * size_penalty)
+
+        containment_score = 0.0
+        if px1 <= fx1 and fx2 <= px2 and py1 <= fy1 and fy2 <= py2:
+            containment_score = 1.0
+        elif px1 <= fcx <= px2 and py1 <= fcy <= py2:
+            containment_score = 0.6
+
+        total_score = (vertical_pos_score * 0.35 +
+                       horizontal_center_score * 0.25 +
+                       size_score * 0.20 +
+                       containment_score * 0.20)
+
+        if total_score > best_score:
+            best_score = total_score
+            best_match = (fx1, fy1, fx2, fy2)
+
+    if best_score < 0.35:
+        return None
     return best_match
 
 
@@ -814,6 +1013,7 @@ class VotingClassifier:
     def __init__(self, window=VOTE_WINDOW):
         self._window = window
         self.male_probs_face = deque(maxlen=window)
+        self.male_probs_body = deque(maxlen=window)
         self.age_votes = deque(maxlen=window)
         self._gender = "Unknown"
         self._age = "?"
@@ -825,68 +1025,164 @@ class VotingClassifier:
         self._last_decided_gender = None
         self._face_locked_gender = None
         self._face_lock_count = 0
+        self._face_count = 0
+        self._body_count = 0
+        self._consecutive_same_gender = 0
+        self._last_raw_gender = None
 
-    def update(self, male_prob, age, raw_age=-1.0, has_face=False):
+    def _raw_gender_from_prob(self, male_prob):
+        if male_prob is None:
+            return None
+        if male_prob >= GENDER_MALE_THRESHOLD:
+            return "Male"
+        if male_prob <= GENDER_FEMALE_THRESHOLD:
+            return "Female"
+        return None
+
+    def _gender_from_weighted_prob(self, prob):
+        if prob >= GENDER_MALE_THRESHOLD:
+            return "Male"
+        if prob <= GENDER_FEMALE_THRESHOLD:
+            return "Female"
+        return None
+
+    def _update_age_vote(self):
+        if self.age_votes:
+            counts = defaultdict(int)
+            for a in self.age_votes:
+                counts[a] += 1
+            self._age = max(counts, key=counts.get)
+
+    def update(self, male_prob, age, raw_age=-1.0, has_face=False, gender_label=None):
         if age and age != "?":
             self.age_votes.append(age)
         if raw_age is not None and raw_age >= 0:
             self._raw_age = float(raw_age)
-        if not has_face or male_prob is None:
-            if self.age_votes:
-                counts = defaultdict(int)
-                for a in self.age_votes:
-                    counts[a] += 1
-                self._age = max(counts, key=counts.get)
+
+        current_raw_gender = self._raw_gender_from_prob(male_prob)
+
+        if current_raw_gender is not None and current_raw_gender == self._last_raw_gender:
+            self._consecutive_same_gender += 1
+        elif current_raw_gender is not None:
+            self._consecutive_same_gender = 1
+        self._last_raw_gender = current_raw_gender
+
+        if not has_face:
+            if male_prob is not None:
+                self.male_probs_body.append(float(male_prob))
+                self._body_count += 1
+            self._update_from_body()
+            self._update_age_vote()
             return
+
+        if male_prob is None:
+            self._update_age_vote()
+            return
+
         self.male_probs_face.append(float(male_prob))
+        self._face_count += 1
         self._face_lock_count += 1
-        n_face = len(self.male_probs_face)
+
+        weighted_prob = self._get_weighted_prob()
+
         if self._face_lock_count >= FACE_LOCK_THRESHOLD and self._face_locked_gender is None:
-            avg = float(np.mean(self.male_probs_face))
-            self._face_locked_gender = "Male" if avg >= GENDER_MALE_BIAS_THRESHOLD else "Female"
+            avg_face_prob = float(np.mean(self.male_probs_face))
+            if avg_face_prob >= FACE_LOCK_STRONG_HIGH:
+                self._face_locked_gender = "Male"
+            elif avg_face_prob <= FACE_LOCK_STRONG_LOW:
+                self._face_locked_gender = "Female"
+
+        n_face = len(self.male_probs_face)
         if n_face < MIN_FACE_VOTES_TO_DECIDE:
-            avg_prob = float(np.mean(self.male_probs_face))
-            self._gender = "Male" if avg_prob >= GENDER_MALE_BIAS_THRESHOLD else "Female"
-            self._last_decided_gender = self._gender
-            if self.age_votes:
-                counts = defaultdict(int)
-                for a in self.age_votes:
-                    counts[a] += 1
-                self._age = max(counts, key=counts.get)
+            candidate = self._gender_from_weighted_prob(weighted_prob)
+            if candidate is not None:
+                self._gender = candidate
+                self._last_decided_gender = self._gender
+            self._update_age_vote()
             return
+
         if self._face_locked_gender is not None:
             new_gender = self._face_locked_gender
         else:
-            avg_prob = float(np.mean(self.male_probs_face))
-            new_gender = "Male" if avg_prob >= GENDER_MALE_BIAS_THRESHOLD else "Female"
+            new_gender = self._gender_from_weighted_prob(weighted_prob)
+            if new_gender is None:
+                self._update_age_vote()
+                return
+
         if self._last_decided_gender is not None and new_gender != self._last_decided_gender:
-            self._flip_count += 1
-            self._stable_streak = 0
+            if self._consecutive_same_gender < 3:
+                self._flip_count += 1
+                self._stable_streak = 0
+            else:
+                self._stable_streak += 1
         else:
             self._stable_streak += 1
         self._last_decided_gender = new_gender
+
         if not self._confirmed:
             self._gender = new_gender
             self._confirm_streak += 1
-            if self._confirm_streak >= MIN_FACE_VOTES_TO_DECIDE:
+            if self._confirm_streak >= MIN_GENDER_VOTES_TO_DECIDE:
                 self._confirmed = True
         else:
             if new_gender == self._gender:
                 self._confirm_streak = min(self._confirm_streak + 1, 60)
             else:
                 if self._face_locked_gender is None:
-                    self._flip_count += 1
-                    self._confirm_streak -= 3
-                    self._stable_streak = 0
-                    if self._confirm_streak <= 0:
+                    if self._consecutive_same_gender < 3:
+                        self._flip_count += 1
+                        self._confirm_streak -= 3
+                        self._stable_streak = 0
+                        if self._confirm_streak <= 0:
+                            self._gender = new_gender
+                            self._confirmed = False
+                            self._confirm_streak = MIN_GENDER_VOTES_TO_DECIDE // 2
+                    else:
                         self._gender = new_gender
-                        self._confirmed = False
-                        self._confirm_streak = MIN_FACE_VOTES_TO_DECIDE // 2
-        if self.age_votes:
-            counts = defaultdict(int)
-            for a in self.age_votes:
-                counts[a] += 1
-            self._age = max(counts, key=counts.get)
+                        self._confirm_streak = MIN_GENDER_VOTES_TO_DECIDE
+                else:
+                    self._gender = self._face_locked_gender
+                    self._confirm_streak = MIN_GENDER_VOTES_TO_DECIDE
+
+        self._update_age_vote()
+
+    def _update_from_body(self):
+        n_body = len(self.male_probs_body)
+        if n_body < MIN_GENDER_VOTES_TO_DECIDE:
+            return
+        avg_body_prob = float(np.mean(self.male_probs_body))
+        if avg_body_prob >= BODY_CONFIDENT_HIGH:
+            body_gender = "Male"
+        elif avg_body_prob <= BODY_CONFIDENT_LOW:
+            body_gender = "Female"
+        else:
+            return
+        if self._gender == "Unknown" or self._face_count < MIN_FACE_VOTES_TO_DECIDE:
+            self._gender = body_gender
+            self._last_decided_gender = body_gender
+
+    def _get_weighted_prob(self):
+        n_face = len(self.male_probs_face)
+        n_body = len(self.male_probs_body)
+        if n_face == 0 and n_body == 0:
+            return 0.5
+        if n_face == 0:
+            return float(np.mean(self.male_probs_body))
+        if n_body == 0:
+            return float(np.mean(self.male_probs_face))
+
+        face_std = np.std(self.male_probs_face) if n_face > 1 else 0.3
+        body_std = np.std(self.male_probs_body) if n_body > 1 else 0.3
+        face_confidence_factor = 1.0 / (1.0 + face_std * 3)
+        body_confidence_factor = 1.0 / (1.0 + body_std * 3)
+
+        face_weight = FACE_VOTE_WEIGHT * n_face * face_confidence_factor
+        body_weight = BODY_VOTE_WEIGHT * n_body * body_confidence_factor
+        total_weight = face_weight + body_weight
+
+        face_contrib = float(np.mean(self.male_probs_face)) * face_weight
+        body_contrib = float(np.mean(self.male_probs_body)) * body_weight
+        return (face_contrib + body_contrib) / total_weight
 
     @property
     def gender(self): return self._gender
@@ -895,14 +1191,14 @@ class VotingClassifier:
     @property
     def raw_age(self): return self._raw_age
     @property
-    def total_votes(self): return len(self.male_probs_face)
+    def total_votes(self): return len(self.male_probs_face) + len(self.male_probs_body)
     @property
     def stable_streak(self): return self._stable_streak
     @property
     def flip_count(self): return self._flip_count
     @property
     def has_confirmed_gender(self):
-        return self._gender != "Unknown" and len(self.male_probs_face) >= 1
+        return self._gender != "Unknown" and (len(self.male_probs_face) >= 1 or len(self.male_probs_body) >= MIN_GENDER_VOTES_TO_DECIDE)
     @property
     def is_stable_for_commit(self):
         return (self._gender != "Unknown"
@@ -913,7 +1209,11 @@ class VotingClassifier:
     def has_confirmed_age(self): return self._age != "?"
     @property
     def mean_male_prob(self):
-        return float(np.mean(self.male_probs_face)) if self.male_probs_face else -1.0
+        if self.male_probs_face:
+            return float(np.mean(self.male_probs_face))
+        if self.male_probs_body:
+            return float(np.mean(self.male_probs_body))
+        return -1.0
 
 
 def _sign(lx1, ly1, lx2, ly2, px, py):
@@ -970,105 +1270,105 @@ class EntryCounter:
         self.reentry_allowed = reentry_allowed
         self._state = {}
         self._prev_pos = {}
-        self._outer_sign = {}
+        self._outer_side_before = {}
         self._outer_frame = {}
+        self._cooldown_until_frame = 0
 
-    def _outer_intersect_t(self, px, py, cx, cy):
+    def _outer_intersect(self, px, py, cx, cy):
         return _segment_line_intersection_t(px, py, cx, cy, self.ox1, self.oy1, self.ox2, self.oy2)
 
-    def _inner_intersect_t(self, px, py, cx, cy):
+    def _inner_intersect(self, px, py, cx, cy):
         return _segment_line_intersection_t(px, py, cx, cy, self.ix1, self.iy1, self.ix2, self.iy2)
 
-    def update(self, track_id, cx, cy, frame_no=0):
-        cx = float(cx)
-        cy = float(cy)
+    def _side_of_outer(self, px, py):
+        return _sign(self.ox1, self.oy1, self.ox2, self.oy2, px, py)
+
+    def _side_of_inner(self, px, py):
+        return _sign(self.ix1, self.iy1, self.ix2, self.iy2, px, py)
+
+    def _reset(self, track_id):
+        self._state[track_id] = self._IDLE
+        self._outer_side_before.pop(track_id, None)
+        self._outer_frame.pop(track_id, None)
+
+    def update(self, track_id, cx, cy, frame_no=0, coasted=False):
+        if coasted:
+            return False
+
+        cx, cy = float(cx), float(cy)
         prev = self._prev_pos.get(track_id)
         self._prev_pos[track_id] = (cx, cy)
 
         if prev is None:
-            self._state[track_id] = self._IDLE
-            self._outer_sign.pop(track_id, None)
-            self._outer_frame.pop(track_id, None)
+            self._state.setdefault(track_id, self._IDLE)
+            return False
+
+        px, py = prev
+
+        if abs(cx - px) < 1.0 and abs(cy - py) < 1.0:
             return False
 
         state = self._state.get(track_id, self._IDLE)
-        px, py = prev
-
-        t_outer = self._outer_intersect_t(px, py, cx, cy)
-        t_inner = self._inner_intersect_t(px, py, cx, cy)
+        t_outer = self._outer_intersect(px, py, cx, cy)
+        t_inner = self._inner_intersect(px, py, cx, cy)
 
         if state == self._COUNTED:
             if self.reentry_allowed and t_outer is not None:
-                self._state[track_id] = self._IDLE
-                self._outer_sign.pop(track_id, None)
-                self._outer_frame.pop(track_id, None)
-            return False
-
-        if t_outer is not None and t_inner is not None:
-            if t_outer <= t_inner:
-                inner_approach = _sign(self.ix1, self.iy1, self.ix2, self.iy2, px, py)
-                outer_approach = _sign(self.ox1, self.oy1, self.ox2, self.oy2, px, py)
-                if inner_approach * outer_approach >= 0:
-                    self.entry_count += 1
-                    self._state[track_id] = self._COUNTED
-                    return True
-                else:
-                    self._state[track_id] = self._SAW_OUTER
-                    self._outer_sign[track_id] = outer_approach
+                side_before = self._side_of_outer(px, py)
+                if side_before != 0:
+                    self._outer_side_before[track_id] = side_before
                     self._outer_frame[track_id] = frame_no
-                    return False
-            else:
-                self._state[track_id] = self._IDLE
-                self._outer_sign.pop(track_id, None)
-                self._outer_frame.pop(track_id, None)
-                return False
-
-        if state == self._SAW_OUTER:
-            frames_waiting = frame_no - self._outer_frame.get(track_id, frame_no)
-            if frames_waiting > ENTRY_COUNTER_SAW_OUTER_TIMEOUT_FRAMES:
-                self._state[track_id] = self._IDLE
-                self._outer_sign.pop(track_id, None)
-                self._outer_frame.pop(track_id, None)
-                state = self._IDLE
+                    self._state[track_id] = self._SAW_OUTER
+            return False
 
         if state == self._IDLE:
             if t_outer is not None:
-                self._state[track_id] = self._SAW_OUTER
-                self._outer_sign[track_id] = _sign(self.ox1, self.oy1, self.ox2, self.oy2, px, py)
+                side_before = self._side_of_outer(px, py)
+                if side_before == 0:
+                    return False
+                self._outer_side_before[track_id] = side_before
                 self._outer_frame[track_id] = frame_no
+                self._state[track_id] = self._SAW_OUTER
             return False
 
         if state == self._SAW_OUTER:
+            elapsed = frame_no - self._outer_frame.get(track_id, frame_no)
+            if elapsed > ENTRY_COUNTER_SAW_OUTER_TIMEOUT_FRAMES:
+                self._reset(track_id)
+                return False
+
             if t_outer is not None:
-                new_sign = _sign(self.ox1, self.oy1, self.ox2, self.oy2, px, py)
-                prev_sign = self._outer_sign.get(track_id, 0.0)
-                if prev_sign != 0.0 and new_sign * prev_sign < 0:
-                    self._state[track_id] = self._IDLE
-                    self._outer_sign.pop(track_id, None)
-                    self._outer_frame.pop(track_id, None)
+                side_now = self._side_of_outer(px, py)
+                orig_side = self._outer_side_before.get(track_id, 0)
+                if orig_side != 0 and side_now != 0 and side_now * orig_side < 0:
+                    self._reset(track_id)
                 else:
-                    self._outer_sign[track_id] = new_sign
                     self._outer_frame[track_id] = frame_no
                 return False
 
             if t_inner is not None:
-                outer_approach = self._outer_sign.get(track_id, 0.0)
-                inner_approach = _sign(self.ix1, self.iy1, self.ix2, self.iy2, px, py)
-                if outer_approach != 0.0 and outer_approach * inner_approach > 0:
-                    self.entry_count += 1
+                side_before_inner = self._side_of_inner(px, py)
+                orig_outer_side = self._outer_side_before.get(track_id, 0)
+                if orig_outer_side != 0 and side_before_inner != 0 and orig_outer_side * side_before_inner > 0:
+                    if frame_no >= self._cooldown_until_frame:
+                        self.entry_count += 1
+                        self._cooldown_until_frame = frame_no + ENTRY_LINE_COOLDOWN_FRAMES
+                        self._state[track_id] = self._COUNTED
+                        self._outer_side_before.pop(track_id, None)
+                        self._outer_frame.pop(track_id, None)
+                        return True
                     self._state[track_id] = self._COUNTED
-                    return True
-                else:
-                    self._state[track_id] = self._IDLE
-                    self._outer_sign.pop(track_id, None)
+                    self._outer_side_before.pop(track_id, None)
                     self._outer_frame.pop(track_id, None)
+                    return False
+                self._reset(track_id)
 
         return False
 
     def remove_track(self, track_id):
         self._prev_pos.pop(track_id, None)
         self._state.pop(track_id, None)
-        self._outer_sign.pop(track_id, None)
+        self._outer_side_before.pop(track_id, None)
         self._outer_frame.pop(track_id, None)
 
 
@@ -1198,6 +1498,10 @@ class FaceDetectorYOLO:
         for r in self.model(frame_bgr, imgsz=FACE_DET_SIZE, conf=FACE_DET_THRESH, verbose=False):
             for b in r.boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                face_w = x2 - x1
+                face_h = y2 - y1
+                if face_w < MIN_FACE_SIZE // 2 or face_h < MIN_FACE_SIZE // 2:
+                    continue
                 faces.append({"bbox": (x1, y1, x2, y2)})
         return faces
 
@@ -1392,6 +1696,7 @@ class CameraPipeline:
         self.entries_emitted = set()
         self.active_ids = set()
         self._footfall_tick = {}
+        self._face_absence_counter = {}
         self.frame_queue = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
         self.stop_event = threading.Event()
         self.reader = RTSPReader(self.rtsp_url, self.frame_queue, self.stop_event)
@@ -1517,18 +1822,34 @@ class CameraPipeline:
                     tid = int(track[4])
                     tbbox = (int(track[0]), int(track[1]), int(track[2]), int(track[3]))
                     face_bbox = track_face_map.get(tid)
-                    if _is_back_view(tbbox, face_bbox, full_res_frame.shape):
+
+                    is_back = _is_true_back_view(tbbox, face_bbox, full_res_frame.shape)
+
+                    if is_back and face_bbox is None:
+                        self._face_absence_counter[tid] = self._face_absence_counter.get(tid, 0) + 1
+                        if self._face_absence_counter[tid] > BACK_VIEW_FACE_PRESENCE_WINDOW:
+                            continue
+                        batch_items.append((tid, tbbox, None))
                         continue
+
+                    if face_bbox is None and not is_back:
+                        batch_items.append((tid, tbbox, None))
+                        continue
+
+                    self._face_absence_counter[tid] = 0
                     crop = full_res_frame[tbbox[1]:tbbox[3], tbbox[0]:tbbox[2]]
                     if not _is_sharp_enough(crop):
+                        batch_items.append((tid, tbbox, None))
                         continue
                     batch_items.append((tid, tbbox, face_bbox))
 
-                for result in self.classifier.predict_batch(full_res_frame, batch_items):
-                    tid, gender_label, raw_age, male_prob = result
-                    if tid not in self.voters:
-                        self.voters[tid] = VotingClassifier()
-                    self.voters[tid].update(male_prob, get_age_bucket(raw_age), float(raw_age), has_face=True)
+                if batch_items:
+                    for result in self.classifier.predict_batch(full_res_frame, batch_items):
+                        tid, gender_label, raw_age, male_prob, has_face = result
+                        if tid not in self.voters:
+                            self.voters[tid] = VotingClassifier()
+                        self.voters[tid].update(male_prob, get_age_bucket(raw_age), float(raw_age),
+                                                has_face=has_face, gender_label=gender_label)
 
             current_ids = set()
             for track in tracks:
@@ -1546,7 +1867,7 @@ class CameraPipeline:
                 foot_cy = float(y2)
 
                 for line_name, counter in self.line_counters.items():
-                    if counter.update(tid, foot_cx, foot_cy, self.frame_count):
+                    if counter.update(tid, foot_cx, foot_cy, self.frame_count, coasted=coasted):
                         key = (tid, line_name)
                         if key not in self.entries_emitted and key not in self.pending_entry_commits:
                             self.pending_entry_commits[key] = {
@@ -1554,14 +1875,13 @@ class CameraPipeline:
                                 "frame_budget": ENTRY_COMMIT_FRAME_BUDGET
                             }
 
-                for (pt_tid, line_name) in list(self.pending_entry_commits.keys()):
-                    if pt_tid != tid:
-                        continue
-                    pec = self.pending_entry_commits[(tid, line_name)]
+                pending_keys_for_tid = [(tid, ln) for ln in self.line_counters if (tid, ln) in self.pending_entry_commits]
+                for key in pending_keys_for_tid:
+                    pec = self.pending_entry_commits[key]
                     pec["frame_budget"] -= 1
                     cg, is_fully_stable = resolve_gender_for_commit(voter)
                     if is_fully_stable or pec["frame_budget"] <= 0:
-                        self._flush_entry_commit(tid, line_name, voter, self.gen_age_enabled)
+                        self._flush_entry_commit(tid, key[1], voter, self.gen_age_enabled)
 
                 if not coasted:
                     last_ft = self._footfall_tick.get(tid, -FOOTFALL_DETECT_INTERVAL)
@@ -1594,6 +1914,7 @@ class CameraPipeline:
                 self.voters.pop(gid, None)
                 self.db_written_face.discard(gid)
                 self._footfall_tick.pop(gid, None)
+                self._face_absence_counter.pop(gid, None)
                 for line_name in list(self.line_counters):
                     self.entries_emitted.discard((gid, line_name))
 
