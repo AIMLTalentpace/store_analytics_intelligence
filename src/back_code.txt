@@ -1,0 +1,685 @@
+import React, { useEffect, useState } from 'react';
+import {
+  Users, Clock, TrendingUp,
+  LogIn, LogOut, RefreshCw, ArrowUpRight
+} from 'lucide-react';
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  CartesianGrid, Cell, RadialBarChart, RadialBar, PolarAngleAxis,
+  LineChart, Line,
+} from 'recharts';
+import './Dashboard.css';
+
+/* ── Default state ── */
+const DEFAULT = {
+  footfall: 0, openingTime: '00:00 AM', closingTime: '00:00 PM',
+  busiestDay: 'N/A', busiestHour: 'N/A',
+  malePercent: 0, femalePercent: 0, malePeak: 'N/A', femalePeak: 'N/A',
+  ageGroups: { '0-20': 0, '21-30': 0, '31-40': 0, '41-50': 0 },
+  genderAge: {
+    '0-20': { male: 0, female: 0 }, '21-30': { male: 0, female: 0 },
+    '31-40': { male: 0, female: 0 }, '41-50': { male: 0, female: 0 },
+  },
+  entryCount: 0, exitCount: 0,
+  maleIn: 0, maleOut: 0, femaleIn: 0, femaleOut: 0,
+  hourlyTraffic: {},
+};
+
+const AGE_COLORS = ['#22d3ee', '#34d399', '#fbbf24', '#f87171'];
+
+/* ── Components ── */
+const ChartTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="dash-tooltip">
+      <p className="dash-tooltip__label">{label}</p>
+      {payload.map((p, i) => (
+        <p key={i} style={{ color: p.fill || p.stroke || p.color }}>
+          {p.name}: <strong>{p.value}</strong>
+        </p>
+      ))}
+    </div>
+  );
+};
+
+const StatCard = ({ icon: Icon, label, value, colorClass, trend }) => (
+  <div className={`stat-card ${colorClass}`}>
+    <div className="stat-card__icon"><Icon size={20} /></div>
+    <div className="stat-card__body">
+      <p className="stat-card__label">{label}</p>
+      <h2 className="stat-card__value">{value}</h2>
+    </div>
+    {trend && (
+      <span className="stat-card__trend"><ArrowUpRight size={12} /> Live</span>
+    )}
+  </div>
+);
+
+const FlowCard = ({ label, icon: Icon, count, colorClass, subItems }) => (
+  <div className={`flow-card ${colorClass}`}>
+    <div className="flow-card__head">
+      <div className="flow-card__icon"><Icon size={18} /></div>
+      <div>
+        <p className="flow-card__label">{label}</p>
+        <h2 className="flow-card__count">{count.toLocaleString()}</h2>
+      </div>
+    </div>
+    <div className="flow-card__sub">
+      {subItems.map((s, i) => (
+        <div key={i} className="flow-card__sub-row">
+          <span className="flow-card__sub-dot" style={{ background: s.color }} />
+          <span className="flow-card__sub-label">{s.label}</span>
+          <span className="flow-card__sub-val" style={{ color: s.color }}>{s.value}</span>
+        </div>
+      ))}
+    </div>
+  </div>
+);
+
+const GaugeChart = ({ percent, color, label }) => (
+  <div className="gauge">
+    <div className="gauge__svg-wrap">
+      <ResponsiveContainer width={112} height={112}>
+        <RadialBarChart
+          cx="50%" cy="50%"
+          innerRadius="64%" outerRadius="90%"
+          startAngle={210} endAngle={-30}
+          data={[{ value: percent, fill: color }]}
+        >
+          <PolarAngleAxis type="number" domain={[0, 100]} tick={false} />
+          <RadialBar
+            dataKey="value"
+            cornerRadius={6}
+            background={{ fill: 'rgba(255,255,255,0.05)' }}
+          />
+        </RadialBarChart>
+      </ResponsiveContainer>
+      <div className="gauge__center">
+        <span className="gauge__pct" style={{ color }}>{percent}%</span>
+        <span className="gauge__label">{label}</span>
+      </div>
+    </div>
+  </div>
+);
+
+/* ── Main Dashboard ── */
+export default function Dashboard() {
+  const [data, setData] = useState(DEFAULT);
+  const [loading, setLoading] = useState(false);
+  const [lastUpdated, setLast] = useState(null);
+  
+  // Date states
+  const todayStr = new Date().toISOString().split('T')[0];
+  const [dateInput, setDateInput] = useState(todayStr); // For the input field
+  const [activeDate, setActiveDate] = useState(todayStr); // For the API query
+
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`http://localhost:5000/api/dashboard_stats?date=${activeDate}`);
+      const json = await res.json();
+      setData(json);
+      setLast(new Date().toLocaleTimeString());
+    } catch (err) {
+      console.error("Fetch error:", err);
+    }
+    setLoading(false);
+  };
+
+  // Sync data when activeDate changes
+  useEffect(() => {
+    fetchData();
+    
+    // Live polling only if viewing today's data
+    let intervalId;
+    if (activeDate === todayStr) {
+      intervalId = setInterval(fetchData, 5000);
+    }
+    return () => clearInterval(intervalId);
+  }, [activeDate]);
+
+  const handleApplyDate = () => {
+    setActiveDate(dateInput);
+  };
+
+  /* ── Data Formatting ── */
+  const ageData = Object.entries(data.ageGroups).map(([k, v]) => ({ name: k, value: v }));
+  const genderAgeData = Object.entries(data.genderAge).map(([k, v]) => ({
+    name: k, male: v.male, female: v.female,
+  }));
+
+  const hourlyData = Object.entries(data.hourlyTraffic || {})
+    .map(([hour, counts]) => ({
+      hour,
+      entry: counts.entry ?? 0,
+      exit: counts.exit ?? 0,
+      _sort: (() => {
+        const parts = hour.trim().split(' ');
+        if (parts.length < 2) return 0;
+        const [h, period] = parts;
+        let n = parseInt(h, 10);
+        if (period === 'PM' && n !== 12) n += 12;
+        if (period === 'AM' && n === 12) n = 0;
+        return n;
+      })(),
+    }))
+    .sort((a, b) => a._sort - b._sort);
+
+  const occupancy = Math.max(0, data.entryCount - data.exitCount);
+  const occupancyPct = data.entryCount > 0
+    ? Math.min(100, (occupancy / data.entryCount) * 100).toFixed(1)
+    : 0;
+
+  return (
+    <div className="dash-page">
+      {/* ── Topbar ── */}
+      <div className="dash-topbar">
+        <div>
+          <h1 className="dash-title">Analytics Dashboard</h1>
+          <p className="dash-sub">
+            Showing data for: <strong>{activeDate}</strong>
+            <span style={{ margin: '0 8px', opacity: 0.3 }}>|</span>
+            Last updated: {lastUpdated ?? '—'}
+            {loading && <span className="spinner" style={{ marginLeft: 8 }} />}
+          </p>
+        </div>
+
+        <div className="dash-controls">
+          <div className='date-range-wrap'><input 
+            type="date" 
+            className="date-input"
+            value={dateInput}
+            onChange={(e) => setDateInput(e.target.value)}
+          /></div>
+          <button className="btn-apply" onClick={handleApplyDate}>
+            Apply
+          </button>
+          <button className="btn-refresh" onClick={fetchData}>
+            <RefreshCw size={14} /> Refresh
+          </button>
+        </div>
+      </div>
+
+      {/* ── KPI grid ── */}
+      <div className="dash-kpi-grid">
+        <StatCard icon={Users} label="Total Footfall" value={data.footfall.toLocaleString()} colorClass="ci" trend={activeDate === todayStr} />
+        <StatCard icon={Clock} label="Opening Time" value={data.openingTime} colorClass="ce" />
+        <StatCard icon={Clock} label="Closing Time" value={data.closingTime} colorClass="cr" />
+        <StatCard icon={TrendingUp} label="Busiest Day" value={data.busiestDay} colorClass="cv" />
+        <StatCard icon={TrendingUp} label="Busiest Hour" value={data.busiestHour} colorClass="ca" />
+        <StatCard icon={Users} label="Male Peak Hour" value={data.malePeak} colorClass="cc" />
+        <StatCard icon={Users} label="Female Peak Hour" value={data.femalePeak} colorClass="cp" />
+      </div>
+
+      {/* ── Flow row ── */}
+      <div className="dash-flow-row">
+        <FlowCard
+          icon={LogIn} label="Total Entries" count={data.entryCount}
+          colorClass="flow-entry"
+          subItems={[
+            { label: 'Male in', value: data.maleIn, color: '#818cf8' },
+            { label: 'Female in', value: data.femaleIn, color: '#f472b6' },
+          ]}
+        />
+        <FlowCard
+          icon={LogOut} label="Total Exits" count={data.exitCount}
+          colorClass="flow-exit"
+          subItems={[
+            { label: 'Male out', value: data.maleOut, color: '#818cf8' },
+            { label: 'Female out', value: data.femaleOut, color: '#f472b6' },
+          ]}
+        />
+        <div className="occupancy-card">
+          <p className="occupancy-card__label">Current Occupancy</p>
+          <h2 className="occupancy-card__count">{occupancy.toLocaleString()}</h2>
+          <p className="occupancy-card__sub">people currently inside</p>
+          <div className="occ-bar">
+            <div className="occ-bar__fill" style={{ width: `${occupancyPct}%` }} />
+          </div>
+          <p className="occ-pct">{occupancyPct}% of peak entries still inside</p>
+        </div>
+        <div className="gauge-card">
+          <p className="gauge-card__label">Gender Split</p>
+          <div className="gauge-card__row">
+            <GaugeChart percent={data.malePercent} color="#818cf8" label="Male" />
+            <GaugeChart percent={data.femalePercent} color="#f472b6" label="Female" />
+          </div>
+        </div>
+      </div>
+
+      {/* ── Gender banner ── */}
+      <div className="gender-banner">
+        <div className="gender-banner__side gender-banner__side--male">
+          <span className="gender-banner__sym">♂</span>
+          <div>
+            <p>Male visitors</p>
+            <h3>{data.malePercent}%</h3>
+          </div>
+        </div>
+        <div className="gender-banner__track">
+          <div className="gender-banner__fill" style={{ width: `${data.malePercent}%` }} />
+        </div>
+        <div className="gender-banner__side gender-banner__side--female">
+          <div className="gender-banner__right">
+            <p>Female visitors</p>
+            <h3>{data.femalePercent}%</h3>
+          </div>
+          <span className="gender-banner__sym">♀</span>
+        </div>
+      </div>
+
+      {/* ── Charts ── */}
+      <div className="dash-charts">
+        <div className="chart-card">
+          <div className="chart-card__head">
+            <h3 className="chart-card__title">Age Groups</h3>
+            <span className="badge badge--emerald">Count</span>
+          </div>
+          <div className="legend-row">
+            {ageData.map((d, i) => (
+              <span key={i} className="legend-item">
+                <span className="legend-dot" style={{ background: AGE_COLORS[i % 4] }} />
+                {d.name}
+              </span>
+            ))}
+          </div>
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={ageData} barSize={42}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.055)" />
+              <XAxis dataKey="name" tick={{ fill: '#94a3b8', fontSize: 12 }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fill: '#94a3b8', fontSize: 11 }} axisLine={false} tickLine={false} />
+              <Tooltip content={<ChartTooltip />} />
+              <Bar dataKey="value" radius={[6, 6, 0, 0]}>
+                {ageData.map((_, i) => <Cell key={i} fill={AGE_COLORS[i % 4]} />)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="chart-card">
+          <div className="chart-card__head">
+            <h3 className="chart-card__title">Hourly Traffic</h3>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <span className="badge badge--emerald">In {data.entryCount}</span>
+              <span className="badge badge--rose">Out {data.exitCount}</span>
+            </div>
+          </div>
+          <div className="legend-row">
+            <span className="legend-item"><span className="legend-dot" style={{ background: '#34d399' }} />Entry</span>
+            <span className="legend-item"><span className="legend-dot" style={{ background: '#f87171' }} />Exit</span>
+          </div>
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart data={hourlyData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.055)" />
+              <XAxis dataKey="hour" tick={{ fill: '#94a3b8', fontSize: 11 }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fill: '#94a3b8', fontSize: 11 }} axisLine={false} tickLine={false} allowDecimals={false} />
+              <Tooltip content={<ChartTooltip />} />
+              <Line type="monotone" dataKey="entry" name="Entry" stroke="#34d399" strokeWidth={2.5} dot={{ r: 3, fill: '#34d399' }} />
+              <Line type="monotone" dataKey="exit" name="Exit" stroke="#f87171" strokeWidth={2.5} dot={{ r: 3, fill: '#f87171' }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="chart-card chart-card--full">
+          <div className="chart-card__head">
+            <h3 className="chart-card__title">Gender vs Age Breakdown</h3>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <span className="badge badge--indigo">Male: {genderAgeData.reduce((s, d) => s + d.male, 0)}</span>
+              <span className="badge badge--pink">Female: {genderAgeData.reduce((s, d) => s + d.female, 0)}</span>
+            </div>
+          </div>
+          <div className="legend-row">
+            <span className="legend-item"><span className="legend-dot" style={{ background: '#6366f1' }} />Male</span>
+            <span className="legend-item"><span className="legend-dot" style={{ background: '#f472b6' }} />Female</span>
+          </div>
+          <ResponsiveContainer width="100%" height={280}>
+            <BarChart data={genderAgeData} barGap={4} barSize={26}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.055)" />
+              <XAxis dataKey="name" tick={{ fill: '#94a3b8', fontSize: 12 }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fill: '#94a3b8', fontSize: 11 }} axisLine={false} tickLine={false} />
+              <Tooltip content={<ChartTooltip />} />
+              <Bar dataKey="male" fill="#6366f1" radius={[5, 5, 0, 0]} name="Male" />
+              <Bar dataKey="female" fill="#f472b6" radius={[5, 5, 0, 0]} name="Female" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+
+
+/* ── Page shell ── */
+.dash-page {
+    padding: 28px 30px 52px;
+    min-height: 100%;
+    background: #0a0f1d;
+    color: #f1f5f9;
+  }
+  
+  /* ── Topbar ── */
+  .dash-topbar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 28px;
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+  .dash-title {
+    font-size: 24px; font-weight: 700;
+    background: linear-gradient(90deg, #f1f5f9, #94a3b8);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .dash-sub {
+    font-size: 12.5px; color: #475569; margin-top: 4px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  
+  /* ── Controls & Date Picker ── */
+  .dash-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .date-input {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    
+    color: #94a3b8;
+    padding: 8px 12px;
+    border-radius: 10px;
+    font-size: 13px;
+    outline: none;
+    transition: all 0.2s;
+    color-scheme: dark;
+  }
+  .date-input:focus {
+    border-color: rgba(99, 102, 241, 0.5);
+    background: rgba(255, 255, 255, 0.08);
+  }
+  
+  .date-range-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 6px 12px;
+  }
+
+  .btn-apply {
+    background: #6366f1;
+    color: white;
+    border: none;
+    padding: 9px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn-apply:hover {
+    background: #4f46e5;
+    box-shadow: 0 0 15px rgba(99, 102, 241, 0.4);
+  }
+  
+  .btn-refresh {
+    display: flex; align-items: center; gap: 7px;
+    padding: 9px 16px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #94a3b8; border-radius: 10px; font-size: 13px;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .btn-refresh:hover {
+    background: rgba(99,102,241,0.15);
+    border-color: rgba(99,102,241,0.4); color: #a5b4fc;
+  }
+  
+  /* ── KPI grid ── */
+  .dash-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(185px, 1fr));
+    gap: 14px; margin-bottom: 22px;
+  }
+  
+  .stat-card {
+    position: relative;
+    background: #0f1629;
+    border-radius: 16px;
+    border: 1px solid rgba(255,255,255,0.07);
+    padding: 18px 18px 16px;
+    display: flex; align-items: flex-start; gap: 14px;
+    overflow: hidden;
+    transition: transform 0.25s, box-shadow 0.25s;
+  }
+  .stat-card:hover { transform: translateY(-3px); }
+  .stat-card::after {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+    width: 3px; border-radius: 16px 0 0 16px;
+  }
+  
+  .stat-card__icon {
+    width: 40px; height: 40px; border-radius: 12px;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .stat-card__label {
+    font-size: 11px; color: #64748b; text-transform: uppercase;
+    letter-spacing: 0.05em; margin-bottom: 5px;
+  }
+  .stat-card__value { font-size: 16px; font-weight: 700; line-height: 1; }
+  .stat-card__trend {
+    position: absolute; top: 13px; right: 13px; font-size: 10px;
+    display: flex; align-items: center; gap: 2px;
+    padding: 3px 8px; border-radius: 20px;
+  }
+  
+  /* Color variants */
+  .ci .stat-card__icon  { background: rgba(99,102,241,0.15);  color: #818cf8; }
+  .ci .stat-card__value { color: #a5b4fc; }
+  .ci::after            { background: #6366f1; }
+  .ci:hover             { box-shadow: 0 8px 30px rgba(99,102,241,0.18); }
+  .ci .stat-card__trend { background: rgba(99,102,241,0.15); color: #818cf8; }
+  
+  .ce .stat-card__icon  { background: rgba(52,211,153,0.15); color: #34d399; }
+  .ce .stat-card__value { color: #6ee7b7; }
+  .ce::after            { background: #10b981; }
+  .ce:hover             { box-shadow: 0 8px 30px rgba(16,185,129,0.15); }
+  
+  .cr .stat-card__icon  { background: rgba(251,113,133,0.15); color: #fb7185; }
+  .cr .stat-card__value { color: #fda4af; }
+  .cr::after            { background: #f43f5e; }
+  .cr:hover             { box-shadow: 0 8px 30px rgba(244,63,94,0.15); }
+  
+  .cv .stat-card__icon  { background: rgba(167,139,250,0.15); color: #a78bfa; }
+  .cv .stat-card__value { color: #c4b5fd; }
+  .cv::after            { background: #8b5cf6; }
+  .cv:hover             { box-shadow: 0 8px 30px rgba(139,92,246,0.15); }
+  
+  .ca .stat-card__icon  { background: rgba(251,191,36,0.15); color: #fbbf24; }
+  .ca .stat-card__value { color: #fcd34d; }
+  .ca::after            { background: #f59e0b; }
+  .ca:hover             { box-shadow: 0 8px 30px rgba(245,158,11,0.15); }
+  
+  .cc .stat-card__icon  { background: rgba(34,211,238,0.15); color: #22d3ee; }
+  .cc .stat-card__value { color: #67e8f9; }
+  .cc::after            { background: #06b6d4; }
+  .cc:hover             { box-shadow: 0 8px 30px rgba(6,182,212,0.15); }
+  
+  .cp .stat-card__icon  { background: rgba(244,114,182,0.15); color: #f472b6; }
+  .cp .stat-card__value { color: #f9a8d4; }
+  .cp::after            { background: #ec4899; }
+  .cp:hover             { box-shadow: 0 8px 30px rgba(236,72,153,0.15); }
+  
+  /* ── Flow row ── */
+  .dash-flow-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+    gap: 14px; margin-bottom: 22px;
+  }
+  
+  .flow-card {
+    background: #0f1629;
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 16px; padding: 18px 20px;
+    transition: transform 0.25s, box-shadow 0.25s;
+  }
+  .flow-card:hover { transform: translateY(-2px); }
+  .flow-entry { border-top: 2px solid #34d399; }
+  .flow-entry:hover { box-shadow: 0 8px 28px rgba(52,211,153,0.12); }
+  .flow-exit  { border-top: 2px solid #f87171; }
+  .flow-exit:hover  { box-shadow: 0 8px 28px rgba(248,113,113,0.12); }
+  
+  .flow-card__head  { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .flow-card__icon {
+    width: 38px; height: 38px; border-radius: 11px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .flow-entry .flow-card__icon { background: rgba(52,211,153,0.15); color: #34d399; }
+  .flow-exit  .flow-card__icon { background: rgba(248,113,113,0.15); color: #f87171; }
+  
+  .flow-card__label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+  .flow-card__count { font-size: 26px; font-weight: 700; }
+  .flow-entry .flow-card__count { color: #6ee7b7; }
+  .flow-exit  .flow-card__count { color: #fca5a5; }
+  
+  .flow-card__sub { display: flex; flex-direction: column; gap: 7px; }
+  .flow-card__sub-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .flow-card__sub-dot   { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .flow-card__sub-label { flex: 1; color: #64748b; }
+  .flow-card__sub-val   { font-weight: 600; font-size: 14px; }
+  
+  /* ── Occupancy card ── */
+  .occupancy-card {
+    background: #0f1629; border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 16px; padding: 18px 20px;
+    border-top: 2px solid #fbbf24;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .occupancy-card__label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+  .occupancy-card__count { font-size: 32px; font-weight: 700; color: #fcd34d; margin: 4px 0 2px; }
+  .occupancy-card__sub   { font-size: 11.5px; color: #64748b; margin-bottom: 12px; }
+  
+  .occ-bar { height: 7px; background: rgba(255,255,255,0.06); border-radius: 99px; overflow: hidden; margin-bottom: 7px; }
+  .occ-bar__fill {
+    height: 100%;
+    background: linear-gradient(90deg, #f59e0b, #fbbf24);
+    border-radius: 99px; transition: width 0.8s ease;
+    box-shadow: 0 0 10px rgba(251,191,36,0.4);
+  }
+  .occ-pct { font-size: 11px; color: #64748b; }
+  
+  /* ── Gauge card ── */
+  .gauge-card {
+    background: #0f1629; border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 16px; padding: 18px 20px;
+    border-top: 2px solid #a78bfa;
+    display: flex; flex-direction: column;
+  }
+  .gauge-card__label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+  .gauge-card__row { display: flex; gap: 6px; justify-content: center; flex: 1; align-items: center; }
+  
+  .gauge { display: flex; align-items: center; justify-content: center; }
+  .gauge__svg-wrap { position: relative; display: flex; align-items: center; justify-content: center; }
+  .gauge__center {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center; pointer-events: none;
+  }
+  .gauge__pct   { display: block; font-size: 16px; font-weight: 700; line-height: 1; }
+  .gauge__label { display: block; font-size: 10px; color: #64748b; margin-top: 2px; }
+  
+  /* ── Gender banner ── */
+  .gender-banner {
+    display: flex; align-items: center; gap: 16px;
+    background: #0f1629; border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 16px; padding: 20px 24px; margin-bottom: 22px;
+  }
+  .gender-banner__side       { display: flex; align-items: center; gap: 12px; min-width: 150px; }
+  .gender-banner__side--female { justify-content: flex-end; }
+  .gender-banner__right      { text-align: right; }
+  .gender-banner__sym        { font-size: 26px; line-height: 1; }
+  .gender-banner__side--male .gender-banner__sym   { color: #818cf8; }
+  .gender-banner__side--female .gender-banner__sym { color: #f472b6; }
+  .gender-banner__side p { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 2px; }
+  .gender-banner__side h3 { font-size: 26px; font-weight: 700; }
+  .gender-banner__side--male h3   { color: #a5b4fc; }
+  .gender-banner__side--female h3 { color: #f9a8d4; }
+  
+  .gender-banner__track { flex: 1; height: 10px; background: rgba(255,255,255,0.06); border-radius: 99px; overflow: hidden; }
+  .gender-banner__fill {
+    height: 100%;
+    background: linear-gradient(90deg, #6366f1, #a855f7, #ec4899);
+    border-radius: 99px; transition: width 0.8s ease;
+    box-shadow: 0 0 10px rgba(99,102,241,0.5);
+  }
+  
+  /* ── Charts grid ── */
+  .dash-charts {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 18px;
+  }
+  
+  .chart-card {
+    background: #0f1629; border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 18px; padding: 22px 22px 14px;
+  }
+  .chart-card--full { grid-column: span 2; }
+  .chart-card__head {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 10px;
+  }
+  .chart-card__title { font-size: 14.5px; font-weight: 600; color: #e2e8f0; }
+  
+  .legend-row  { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #94a3b8; }
+  .legend-dot  { width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0; }
+  
+  .badge {
+    font-size: 11px; font-weight: 600;
+    padding: 3px 10px; border-radius: 20px; letter-spacing: 0.04em;
+  }
+  .badge--indigo  { background: rgba(99,102,241,0.18);  color: #a5b4fc; }
+  .badge--emerald { background: rgba(52,211,153,0.15);  color: #6ee7b7; }
+  .badge--rose    { background: rgba(248,113,113,0.18); color: #fca5a5; }
+  .badge--pink    { background: rgba(244,114,182,0.18); color: #f9a8d4; }
+  
+  /* ── Shared tooltip ── */
+  .dash-tooltip {
+    background: #1a2640; border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; padding: 10px 14px; font-size: 13px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.5);
+  }
+  .dash-tooltip__label {
+    color: #64748b; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.07em; margin-bottom: 5px;
+  }
+  
+  .spinner {
+    width: 14px; height: 14px; border: 2px solid rgba(148,163,184,0.3);
+    border-radius: 50%; border-top-color: #94a3b8;
+    display: inline-block; animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  
+  /* ── Responsive ── */
+  @media (max-width: 1100px) {
+    .dash-flow-row { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 860px) {
+    .dash-charts { grid-template-columns: 1fr; }
+    .chart-card--full { grid-column: span 1; }
+    .gender-banner { flex-direction: column; }
+    .dash-topbar { flex-direction: column; align-items: stretch; }
+    .dash-controls { flex-wrap: wrap; }
+  }
+  @media (max-width: 640px) {
+    .dash-flow-row { grid-template-columns: 1fr; }
+    .dash-page { padding: 18px 16px 40px; }
+    .dash-controls { flex-direction: column; align-items: stretch; }
+    .date-input, .btn-apply, .btn-refresh { width: 100%; justify-content: center; }
+  }
+
+
